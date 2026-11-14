@@ -1,0 +1,421 @@
+module catalog
+
+// Searches Diablo II Resurrected's cube recipes and runewords, on two tabs.
+// The tables in data/ come from tools/extract_tables.py. The search box
+// filters both tabs; every word typed has to be in an entry. Click a tab or
+// press Tab to switch. Click the sort line to order a tab by level. The wheel
+// and the arrows scroll by pixels, so any entry can be brought fully into
+// view; PageUp and PageDown, Home, End too; Escape clears. `catalog --find
+// words` prints the matches instead.
+
+use mara.core
+use mara.files
+use mara.paths
+use mara.sdl
+use mara.memory
+use mara.string
+os :: use mara.os
+
+#allocator Arena_Basic(64 * MB)
+
+TITLE     :: "catalog"
+FONT_SIZE :: 16.0
+PAD       :: 12.0
+INDENT    :: 16.0
+TAB_WIDTH :: 260.0
+TAB_GAP   :: 4.0
+NO_LEVEL  :: 1000000   // sorts after every level
+
+GROUND   :: Color{r = 24, g = 21, b = 18}
+PANEL    :: Color{r = 44, g = 38, b = 32}
+BORDER   :: Color{r = 120, g = 98, b = 62}
+INK      :: Color{r = 226, g = 214, b = 190}
+DIM      :: Color{r = 150, g = 138, b = 116}
+RUNEWORD :: Color{r = 232, g = 186, b = 84}
+CUBE     :: Color{r = 140, g = 190, b = 230}
+
+// The order a tab lists its entries in: as the tables have them, or by level.
+Sort :: union {
+	File_order = 0
+	Lowest_first = 1
+	Highest_first = 2
+}
+
+// What one tab lists: the entries of its section that match the query, by
+// index into the entries, in its sort order, and how far its list is scrolled.
+// Pixels: scroll from the list's top, content the whole list, view the room
+// the list has. Both are set when the window is drawn.
+Listing :: struct {
+	shown:   [1024]i64
+	total:   i64      // every entry of the section, matching or not
+	sort:    Sort
+	scroll:  i64
+	content: i64
+	view:    i64
+}
+
+// The entries from the tables, the search, and the tabs.
+Catalog :: struct(cube, runes, misc, types, armor, weapons: []byte) {
+	entries: [1024]Entry
+	query:   str256
+	views:   [Section]Listing
+	tab:     Section
+	dirty := true
+	running := true
+
+	at : i64 = 0
+	row_no : i64 = 0
+	for at < cube.len {
+		row, next := row_at(cube, at)
+		at = next
+		row_no += 1
+		if row_no > 1 and field(row, 1) == "1" do &entries ++ cube_entry(row, misc, armor, weapons)
+	}
+	at = 0
+	row_no = 0
+	for at < runes.len {
+		row, next := row_at(runes, at)
+		at = next
+		row_no += 1
+		if row_no > 1 and field(row, 2) == "1" do &entries ++ runeword_entry(row, misc, types)
+	}
+	refilter(#self)
+}
+
+// The window, its renderer, and the font at its size.
+Screen :: struct(font_path: []utf8, title: []utf8 = TITLE, width: i32 = 900, height: i32 = 640) -> err {
+	window := sdl.CreateWindow(cstring(title), width, height, sdl.Resizable)?
+	renderer := sdl.CreateRenderer(window, cstring("opengl"))?
+	sdl.SetRenderVSync(renderer, 1)?
+	sdl.StartTextInput(window)?
+	text := Text(renderer, font_path, FONT_SIZE)?
+}
+
+main :: (args: [][]utf8) -> err {
+	exe := exe_path()?
+	dir := get_dir(exe)
+
+	cube_store : [512 * KB]byte
+	runes_store : [512 * KB]byte
+	misc_store : [512 * KB]byte
+	types_store : [256 * KB]byte
+	armor_store : [256 * KB]byte
+	weapons_store : [256 * KB]byte
+	cube := read_entire_file(dir ++ "data/cubemain.txt", &cube_store)?
+	runes := read_entire_file(dir ++ "data/Runes.txt", &runes_store)?
+	misc := read_entire_file(dir ++ "data/misc.txt", &misc_store)?
+	types := read_entire_file(dir ++ "data/ItemTypes.txt", &types_store)?
+	armor := read_entire_file(dir ++ "data/armor.txt", &armor_store)?
+	weapons := read_entire_file(dir ++ "data/weapons.txt", &weapons_store)?
+	cat := Catalog(cube, runes, misc, types, armor, weapons)
+
+	if args.len > 2 and args[1] == "--find" {
+		count := 0
+		for &e in cat.entries {
+			if matches(e, args[2]) {
+				count += 1
+				print(e.title)
+				print(e.detail)
+			}
+		}
+		print(count, "matching entries of", cat.entries.len)
+		return
+	}
+
+	sdl.Init(sdl.Video)?
+	defer sdl.Quit()
+	screen := Screen(dir ++ "Inter.ttf")?
+	defer sdl.DestroyWindow(screen.window)
+	defer sdl.DestroyRenderer(screen.renderer)
+	run(&cat, &screen)
+}
+
+// Each section's shown entries: those matching the query, in its sort order,
+// from the top.
+refilter :: (c: ^Catalog) {
+	for s in Section {
+		c.views[s].shown = []
+		c.views[s].total = 0
+		c.views[s].scroll = 0
+	}
+	for &e, i in c.entries {
+		v := &c.views[e.kind]
+		v.total += 1
+		if matches(e, c.query) do &v.shown ++ i
+	}
+	for s in Section {
+		sort_shown(c, &c.views[s])
+	}
+	c.dirty = true
+}
+
+// The level an entry sorts by. Lowest first and highest first both put an
+// entry with no level last.
+sort_key :: (e: ^Entry, s: Sort) -> i64 {
+	if e.level < 0 do return NO_LEVEL
+	if s == Highest_first do return -e.level
+	return e.level
+}
+
+// Orders a tab's shown entries by its sort: an insertion sort, so entries
+// with the same level keep the order of the tables.
+sort_shown :: (c: ^Catalog, v: ^Listing) {
+	if v.sort == File_order or v.shown.len < 2 do return
+	for i in 1:v.shown.len {
+		k := v.shown[i]
+		key := sort_key(&c.entries[k], v.sort)
+		j := i - 1
+		for j >= 0 and sort_key(&c.entries[v.shown[j]], v.sort) > key {
+			v.shown[j + 1] = v.shown[j]
+			j -= 1
+		}
+		v.shown[j + 1] = k
+	}
+}
+
+// The next sort, when the sort line is clicked.
+next_sort :: (s: Sort) -> Sort {
+	if s == File_order do return Lowest_first
+	if s == Lowest_first do return Highest_first
+	return File_order
+}
+
+sort_name :: (s: Sort) -> str64 {
+	if s == Lowest_first do return "level, lowest first"
+	if s == Highest_first do return "level, highest first"
+	return "file order"
+}
+
+// Moves the active tab's list by px pixels. The bottom is kept in draw, where
+// the list's height is known.
+scroll_by :: (c: ^Catalog, px: i64) {
+	v := &c.views[c.tab]
+	v.scroll += px
+	if v.scroll < 0 do v.scroll = 0
+	c.dirty = true
+}
+
+// Removes the last character of the query, all its bytes.
+backspace :: (c: ^Catalog) {
+	if c.query.len == 0 do return
+	i := c.query.len - 1
+	for i > 0 and (u8(c.query[i]) & 0xC0) == 0x80 do i -= 1
+	c.query.len = i
+	refilter(c)
+}
+
+// The tab's name, as its label starts.
+section_name :: (s: Section) -> str64 {
+	if s == Runewords do return "Runewords"
+	return "Cube recipes"
+}
+
+// The tab bar's top, under the search box, and its height and the left of
+// tab i.
+tab_top :: (t: ^Text) -> f32 {
+	return PAD * 2 + t.line + PAD
+}
+
+tab_height :: (t: ^Text) -> f32 {
+	return t.line + PAD
+}
+
+tab_left :: (i: i64) -> f32 {
+	return PAD + f32(i) * (TAB_WIDTH + TAB_GAP)
+}
+
+// The sort line, under the tab bar.
+sort_top :: (t: ^Text) -> f32 {
+	return tab_top(t) + tab_height(t) + PAD
+}
+
+sort_height :: (t: ^Text) -> f32 {
+	return t.line + PAD
+}
+
+// The top of the list, under the sort line.
+list_top :: (t: ^Text) -> f32 {
+	return sort_top(t) + sort_height(t) + PAD
+}
+
+// Events until the window closes, drawing whenever something changed.
+run :: (c: ^Catalog, screen: ^Screen) {
+	e: sdl.Event
+	for c.running {
+		if c.dirty {
+			draw(c, screen)
+			c.dirty = false
+		}
+		if sdl.WaitEventTimeout(&e, 1000) {
+			handle(c, screen, e)
+			for sdl.PollEvent(&e) {
+				handle(c, screen, e)
+			}
+		}
+	}
+}
+
+// One event: the window closed, resized or shown; text typed; a key; the
+// wheel; a click.
+handle :: (c: ^Catalog, screen: ^Screen, e: sdl.Event) {
+	line := i64(screen.text.line)
+	match e {
+	Quit
+		c.running = false
+	WindowCloseRequested
+		c.running = false
+	WindowResized
+		c.dirty = true
+	WindowPixelSizeChanged
+		c.dirty = true
+	WindowExposed
+		c.dirty = true
+	TextInput input
+		typed := os.read_cstring(256, input.text)
+		if c.query.len + typed.len <= c.query.cap {
+			&c.query ++ typed
+			refilter(c)
+		}
+	MouseWheel wheel
+		scroll_by(c, -i64(wheel.y * 3.0 * screen.text.line))
+	MouseButtonDown press
+		if press.button == 1 do click(c, screen, press.x, press.y)
+	KeyDown key
+		match key.scancode {
+		Escape
+			c.query = []
+			refilter(c)
+		Backspace
+			backspace(c)
+		Tab
+			c.tab = if c.tab == Recipes do Runewords else Recipes
+			c.dirty = true
+		Down
+			scroll_by(c, line)
+		Up
+			scroll_by(c, -line)
+		PageDown
+			scroll_by(c, c.views[c.tab].view - line)
+		PageUp
+			scroll_by(c, -(c.views[c.tab].view - line))
+		Home
+			c.views[c.tab].scroll = 0
+			c.dirty = true
+		End
+			c.views[c.tab].scroll = c.views[c.tab].content
+			c.dirty = true
+		else
+		}
+	else
+	}
+}
+
+// A click on a tab switches to it; a click on the sort line changes the sort.
+click :: (c: ^Catalog, screen: ^Screen, x: f32, y: f32) {
+	t := &screen.text
+	if y >= tab_top(t) and y < tab_top(t) + tab_height(t) {
+		for s, i in Section {
+			if x >= tab_left(i) and x < tab_left(i) + TAB_WIDTH do c.tab = s
+		}
+		c.dirty = true
+	}
+	if y >= sort_top(t) and y < sort_top(t) + sort_height(t) {
+		v := &c.views[c.tab]
+		v.sort = next_sort(v.sort)
+		v.scroll = 0
+		sort_shown(c, v)
+		c.dirty = true
+	}
+}
+
+// How tall an entry is drawn: its title, its detail lines, and half a line
+// below. draw_entry draws to match.
+entry_height :: (t: ^Text, e: ^Entry) -> f32 {
+	lines : i64 = 1
+	detail : []utf8 = e.detail
+	if detail.len > 0 do lines += 1
+	for ch in detail {
+		if ch == '\n' do lines += 1
+	}
+	return t.line * f32(lines) + t.line * 0.5
+}
+
+// The search box with what's typed, the two tabs, the sort line, then the
+// active tab's entries, scrolled, as far as the window shows them. The list
+// is clipped to its own area, so a part of an entry above or below it isn't
+// drawn over the tabs.
+draw :: (c: ^Catalog, screen: ^Screen) {
+	fw: i32
+	fh: i32
+	_ = sdl.GetRenderOutputSize(screen.renderer, &fw, &fh)
+	width := f32(fw)
+	height := f32(fh)
+	fill_rect(screen.renderer, 0, 0, width, height, GROUND)
+
+	box_height := screen.text.line + PAD
+	fill_rect(screen.renderer, PAD, PAD, width - 2 * PAD, box_height, BORDER)
+	fill_rect(screen.renderer, PAD + 1, PAD + 1, width - 2 * PAD - 2, box_height - 2, PANEL)
+	label_y := PAD + (box_height - screen.text.line) / 2
+	pen := text_draw(&screen.text, screen.renderer, "Search: ", PAD * 2, label_y, DIM)
+	pen = text_draw(&screen.text, screen.renderer, c.query, pen, label_y, INK)
+	_ = text_draw(&screen.text, screen.renderer, "|", pen, label_y, RUNEWORD)
+
+	top := tab_top(&screen.text)
+	h := tab_height(&screen.text)
+	for s, i in Section {
+		x := tab_left(i)
+		active := s == c.tab
+		back := if active do PANEL else GROUND
+		ink := if active do INK else DIM
+		fill_rect(screen.renderer, x, top, TAB_WIDTH, h, BORDER)
+		fill_rect(screen.renderer, x + 1, top + 1, TAB_WIDTH - 2, h - 2, back)
+		label : str64
+		&label ++ section_name(s) ++ "   " ++ int_text(c.views[s].shown.len) ++ " of " ++ int_text(c.views[s].total)
+		_ = text_draw(&screen.text, screen.renderer, label, x + PAD, top + PAD / 2, ink)
+	}
+
+	v := &c.views[c.tab]
+	sort_label : str64
+	&sort_label ++ "Sort: " ++ sort_name(v.sort) ++ "   (click to change)"
+	_ = text_draw(&screen.text, screen.renderer, sort_label, PAD, sort_top(&screen.text) + PAD / 2, DIM)
+
+	// The list's room, and how tall all of it is; the scroll kept within them.
+	top_of_list := list_top(&screen.text)
+	v.view = i64(height - top_of_list)
+	content : f32 = 0
+	for k in 0:v.shown.len {
+		content += entry_height(&screen.text, &c.entries[v.shown[k]])
+	}
+	v.content = i64(content)
+	if v.scroll > v.content - v.view do v.scroll = v.content - v.view
+	if v.scroll < 0 do v.scroll = 0
+
+	clip := sdl.SDL_Rect{x = 0, y = i32(top_of_list), w = i32(width), h = i32(height - top_of_list)}
+	_ = sdl.SetRenderClipRect(screen.renderer, &clip)
+	y := top_of_list - f32(v.scroll)
+	for k in 0:v.shown.len {
+		entry := &c.entries[v.shown[k]]
+		step := entry_height(&screen.text, entry)
+		if y + step > top_of_list and y < height do draw_entry(&screen.text, screen.renderer, entry, PAD, y)
+		y += step
+		if y >= height do break
+	}
+	_ = sdl.SetRenderClipRect(screen.renderer, void)
+	_ = sdl.RenderPresent(screen.renderer)
+}
+
+// An entry's title, then its detail lines indented.
+draw_entry :: (t: ^Text, renderer: sdl.Renderer, e: ^Entry, x: f32, y: f32) {
+	color := CUBE
+	if e.kind == Runewords do color = RUNEWORD
+	_ = text_draw(t, renderer, e.title, x, y, color)
+	y2 := y + t.line
+	detail : []utf8 = e.detail
+	at : i64 = 0
+	for at < detail.len {
+		end := line_end(detail, at)
+		_ = text_draw(t, renderer, detail[at:end], x + INDENT, y2, INK)
+		y2 += t.line
+		at = end + 1
+	}
+}

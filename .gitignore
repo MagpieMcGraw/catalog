@@ -1,0 +1,8 @@
+# Build outputs: rebuilt by `mara build catalog`
+catalog.exe
+*.pdb
+catalog_build/
+__pycache__/
+
+# Game tables (Blizzard's files, copied by tools/extract_tables.py): kept out of a public repo
+data/

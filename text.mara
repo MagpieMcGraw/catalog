@@ -1,0 +1,97 @@
+module catalog
+
+use mara.core
+use mara.math
+use mara.string
+use mara.font
+use mara.sdl
+
+// Text drawn pixel for pixel: a font's glyphs at one size, white in a
+// texture and drawn in any color by color mod. Text is UTF-8: ASCII's
+// characters and EXTRA's have glyphs; any other draws as '?'.
+
+ATLAS  :: 512
+GLYPHS :: 128
+
+// Past ASCII's: the dashes, arrows and marks the recipes use.
+EXTRA :: "—–·∞…←→↑↓⟵⟶•×≤≥≠✦"
+
+// A color: red, green, blue.
+Color :: struct {
+	r: u8
+	g: u8
+	b: u8
+}
+
+// The font at one size, `pixels` high (its em). ascent is a line's top to
+// its baseline; line is a line's height. Both whole pixels.
+Text :: struct(renderer: sdl.Renderer, font_path: []utf8, pixels: f32) -> err {
+	chars: [GLYPHS]u32
+	glyphs: [GLYPHS]font.Glyph
+	metrics: font.Line_Metrics
+	ascent: f32
+	line: f32
+
+	for c in 32:127 do &chars ++ u32(c)
+	at : i64 = 0
+	for at < EXTRA.len {
+		c, n := char_at(EXTRA, at)
+		&chars ++ c
+		at += n
+	}
+
+	atlas : [ATLAS * ATLAS]byte
+	font.load_coverage_chars(font_path, pixels, chars, &glyphs, &metrics, &atlas, ATLAS)?
+	rgba : [ATLAS * ATLAS * 4]byte
+	rgba.len = rgba.cap
+	for i in 0:atlas.len {
+		rgba[i * 4] = u8(255)
+		rgba[i * 4 + 1] = u8(255)
+		rgba[i * 4 + 2] = u8(255)
+		rgba[i * 4 + 3] = atlas[i]
+	}
+
+	texture := sdl.CreateTexture(renderer, sdl.PIXELFORMAT_RGBA32, sdl.TEXTUREACCESS_STATIC, ATLAS, ATLAS)?
+	sdl.UpdateTexture(texture, void, rgba.ptr, ATLAS * 4)?
+	sdl.SetTextureBlendMode(texture, sdl.BLENDMODE_BLEND)?
+	sdl.SetTextureScaleMode(texture, sdl.SCALEMODE_NEAREST)?
+	ascent = ceil_f32(metrics.ascent)
+	line = ceil_f32(metrics.ascent - metrics.descent + metrics.line_gap)
+}
+
+// The pen after the text drawn at x, its line's top at y, in a color. Each
+// glyph sits at the pen rounded to a whole pixel.
+text_draw :: (t: ^Text, renderer: sdl.Renderer, s: []utf8, x: f32, y: f32, color: Color) -> f32 {
+	_ = sdl.SetTextureColorMod(t.texture, color.r, color.g, color.b)
+	pen := x
+	baseline := floor_f32(y) + t.ascent
+	at : i64 = 0
+	for at < s.len {
+		c, n := char_at(s, at)
+		at += n
+		g := t.glyphs[glyph_of(t, c)]
+		if g.w > 0 {
+			from := sdl.SDL_FRect{x = f32(g.x), y = f32(g.y), w = f32(g.w), h = f32(g.h)}
+			to := sdl.SDL_FRect{x = floor_f32(pen + 0.5) + g.bearing_x, y = baseline - g.bearing_y, w = f32(g.w), h = f32(g.h)}
+			_ = sdl.RenderTexture(renderer, t.texture, &from, &to)
+		}
+		pen += g.advance
+	}
+	return pen
+}
+
+// The glyph's index for a character; '?' for one the font doesn't have.
+glyph_of :: (t: ^Text, c: u32) -> i64 {
+	if c >= 32 and c < 127 do return i64(c) - 32
+	for k in 95:t.chars.len {
+		if t.chars[k] == c do return k
+	}
+	return i64('?') - 32
+}
+
+// A filled rectangle, in pixels.
+fill_rect :: (renderer: sdl.Renderer, x: f32, y: f32, w: f32, h: f32, color: Color) {
+	_ = sdl.SetRenderDrawColor(renderer, color.r, color.g, color.b, 255)
+	r := sdl.SDL_FRect{x = x, y = y, w = w, h = h}
+	_ = sdl.RenderFillRect(renderer, &r)
+}

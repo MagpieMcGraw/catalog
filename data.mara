@@ -1,0 +1,185 @@
+module catalog
+
+// The game's tables become the entries the window shows.
+
+use mara.core
+use mara.string
+
+// The two lists: cube recipes, and runewords.
+Section :: union {
+	Recipes = 0
+	Runewords = 1
+}
+
+// A recipe or a runeword: its section, its level (-1 when none is known), a
+// title, and detail lines with '\n' between them.
+Entry :: struct {
+	kind:   Section
+	level:  i64 = -1
+	title:  str1024
+	detail: str1024
+}
+
+// The row starting at `at` (no line end), and where the next row starts.
+row_at :: (text: []utf8, at: i64) -> []utf8, i64 {
+	end := line_end(text, at)
+	row := text[at:end]
+	if row.len > 0 and row[row.len - 1] == '\r' do row = text[at:end - 1]
+	return row, end + 1
+}
+
+// Column k of a tab-separated row, from 0; empty past the last column.
+field :: (row: []utf8, k: i64) -> []utf8 {
+	rest := row
+	for i in 0:k {
+		_, after, found := cut(rest, '\t')
+		if not found do return rest[rest.len:]
+		rest = after
+	}
+	head, _, _ := cut(rest, '\t')
+	return head
+}
+
+// Column value_col of the first row whose key_col is key; empty if none.
+lookup :: (table: []utf8, key_col: i64, key: []utf8, value_col: i64) -> []utf8 {
+	if key.len == 0 do return table[table.len:]
+	at : i64 = 0
+	for at < table.len {
+		row, next := row_at(table, at)
+		at = next
+		if field(row, key_col) == key do return field(row, value_col)
+	}
+	return table[table.len:]
+}
+
+// The index of the column named name in a table's first row; -1 if none.
+column :: (table: []utf8, name: []utf8) -> i64 {
+	head, _ := row_at(table, 0)
+	rest := head
+	k : i64 = 0
+	more := true
+	for more {
+		col, after, found := cut(rest, '\t')
+		if col == name do return k
+		more = found
+		rest = after
+		k += 1
+	}
+	return -1
+}
+
+// The number in column name of the row whose code is code; -1 if the table
+// has no such column, no such row, or no number there.
+table_number :: (table: []utf8, code: []utf8, name: []utf8) -> i64 {
+	code_col := column(table, "code")
+	num_col := column(table, name)
+	if code_col < 0 or num_col < 0 do return -1
+	n, ok := parse_number(lookup(table, code_col, code, num_col))
+	if not ok do return -1
+	return i64(n)
+}
+
+// An item's level requirement, from weapons.txt, armor.txt or misc.txt; -1 if
+// none of them has the code.
+item_level :: (code: []utf8, misc: []utf8, armor: []utf8, weapons: []utf8) -> i64 {
+	n := table_number(weapons, code, "levelreq")
+	if n < 0 do n = table_number(armor, code, "levelreq")
+	if n < 0 do n = table_number(misc, code, "levelreq")
+	return n
+}
+
+// "Ral Rune" is "Ral".
+short_rune :: (name: []utf8) -> []utf8 {
+	if ends_with(name, " Rune") do return name[0:name.len - 5]
+	return name
+}
+
+// A row of cubemain.txt. Its description is "A + B -> C": the title is the
+// result C, and each ingredient is a line of detail. A piece starting "Act"
+// continues the one before it (the uber summon's "from Act 1 + Act2 ...").
+// The level is the result's: the code in output (before any comma).
+cube_entry :: (row: []utf8, misc: []utf8, armor: []utf8, weapons: []utf8) -> Entry {
+	e := Entry()
+	desc := trimmed(field(row, 0))
+	at, arrow := find(desc, " -> ")
+	if not arrow do &e.title ++ desc
+	if arrow {
+		&e.title ++ trimmed(desc[at + 4:])
+		n : i64 = 0
+		for part in chop(desc[0:at], '+') {
+			piece := trimmed(part)
+			if piece.len == 0 do continue
+			if n > 0 and not starts_with(piece, "Act") do &e.detail ++ "\n"
+			if n > 0 and starts_with(piece, "Act") do &e.detail ++ " + "
+			&e.detail ++ piece
+			n += 1
+		}
+	}
+	difficulty := field(row, 4)
+	if difficulty == "1" do &e.detail ++ "\nNeeds Nightmare difficulty"
+	if difficulty == "2" do &e.detail ++ "\nNeeds Hell difficulty"
+
+	output, _, _ := cut(field(row, 18), ',')
+	if output.len > 0 and output[0] == '"' do output = output[1:]
+	e.level = item_level(trimmed(output), misc, armor, weapons)
+	if e.level == 0 do &e.detail ++ "\nNo level requirement"
+	if e.level > 0 do &e.detail ++ "\nLevel " ++ int_text(e.level)
+	return e
+}
+
+// A row of Runes.txt, with rune and item-type names from misc.txt and
+// ItemTypes.txt. Columns: 1 name, 8-13 item types, 18-23 runes, then up to
+// seven bonus stats of four columns from 24: code, parameter, min, max. The
+// level is the highest rune's: the runeword's own level isn't in the table.
+runeword_entry :: (row: []utf8, misc: []utf8, types: []utf8) -> Entry {
+	e := Entry(){kind = Runewords}
+	&e.title ++ trimmed(field(row, 1))
+
+	&e.detail ++ "Runes: "
+	for i in 0:6 {
+		code := field(row, 18 + i)
+		if code.len == 0 do break
+		if i > 0 do &e.detail ++ " + "
+		name := lookup(misc, 15, code, 0)
+		if name.len == 0 do name = code
+		&e.detail ++ short_rune(name)
+		if table_number(misc, code, "level") > e.level do e.level = table_number(misc, code, "level")
+	}
+	if e.level >= 0 do &e.detail ++ "\nLevel " ++ int_text(e.level) ++ " (its highest rune)"
+
+	&e.detail ++ "\nWorks in: "
+	for i in 0:6 {
+		code := field(row, 8 + i)
+		if code.len == 0 do break
+		if i > 0 do &e.detail ++ ", "
+		name := lookup(types, 1, code, 0)
+		if name.len == 0 do name = lookup(types, 2, code, 0)
+		if name.len == 0 do name = code
+		&e.detail ++ name
+	}
+
+	for i in 0:7 {
+		code := field(row, 24 + 4 * i)
+		if code.len == 0 do break
+		&e.detail ++ "\n" ++ code
+		param := field(row, 25 + 4 * i)
+		if param.len > 0 do &e.detail ++ " (" ++ param ++ ")"
+		low := field(row, 26 + 4 * i)
+		high := field(row, 27 + 4 * i)
+		if low.len > 0 do &e.detail ++ " " ++ low
+		if high.len > 0 and high != low do &e.detail ++ "-" ++ high
+	}
+	return e
+}
+
+// Whether every word of the query is in the title or the detail.
+matches :: (e: ^Entry, query: []utf8) -> bool {
+	rest := trimmed(query)
+	for rest.len > 0 {
+		word, after, more := cut(rest, ' ')
+		if word.len > 0 and not contains_folded(e.title, word) and not contains_folded(e.detail, word) do return false
+		if not more do break
+		rest = after
+	}
+	return true
+}
